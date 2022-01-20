@@ -1,0 +1,12 @@
+*.sublime-workspace
+*.DS_Store
+*.kdev4
+*.dcd
+*.gsd
+build/*
+build
+__pycache__
+*.pyc
+*.swp
+*.code-workspace
+.vscode/
