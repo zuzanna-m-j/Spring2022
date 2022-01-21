@@ -1,21 +1,24 @@
+import hoomd.comm
 import numpy
 from imports import*
 
-# define logging options
-
-seed = random.randint(0,1e7)
-file = sys.argv[0][:-3]
-dir = sys.argv[1]
-os.system(fr'mkdir {dir}')
-with open(fr'{dir}/' + file + '.info', 'w') as info:
-    info.write(f'seed: {seed}\n')
-    info.writelines(f'filename: {file}\n')
-    info.writelines(f'Time: {str(datetime.datetime.now())}')
-os.system(fr'cp {file}.py {dir}/script.py')
-#sys.stdout = open(fr'{dir}/' + file + '.log', 'w')
 
 # initialize simulation context
 hoomd.context.initialize("--mode=cpu")
+
+seed = random.randint(0, 1e7)
+file = sys.argv[0][:-3]
+dir = sys.argv[1]
+
+# define logging options
+if hoomd.comm.get_rank() == 0:
+    os.system(fr'mkdir {dir}')
+    with open(fr'{dir}/' + file + '.info', 'w') as info:
+        info.write(f'seed: {seed}\n')
+        info.writelines(f'filename: {file}\n')
+        info.writelines(f'Time: {str(datetime.datetime.now())}')
+    os.system(fr'cp {file}.py {dir}/script.py')
+#sys.stdout = open(fr'{dir}/' + file + '.log', 'w')
 
 # Define the vertices for the hexagonal lattice
 vAu = [(-0.5220179221316321, -0.16503966450482788),(0.47798207786836777, -0.16503966450482788),(0.04496937597614856, 0.3304527187789308)]
@@ -94,7 +97,7 @@ for t in system.particles.types:
 
 # run the simulation for some time to adjust the move size
 for _ in range(10):
-    hoomd.run(1000)
+    hoomd.run(1e4)
     for t in system.particles.types:
         tuners[t].update()
 
@@ -113,9 +116,10 @@ vol_init = hoomd.analyze.log(filename=fr'{dir}/' + file + '-init.vol', quantitie
 sdf_init = hoomd.hpmc.analyze.sdf(mc=mc, filename=fr'{dir}/' + file + '-init.sdf', xmax=0.001, dx=1e-7, navg=100, period=100, overwrite=True)
 
 print(f'Gather pressure statistics: {hoomd.get_step()}\n')
-hoomd.run(5e5)
-sdf_init.disable()
-vol_init.disable()
+hoomd.run(1e5)
+if hoomd.comm.get_rank() == 0:
+    sdf_init.disable()
+    vol_init.disable()
 print(f"Stop pressure statistics: {hoomd.get_step()}\n")
 
 
@@ -136,8 +140,9 @@ tuner = hpmc.util.tune_npt(boxMC, tunables=['dV'], target=0.3, gamma=1.0)
 for i in range(10):
     hoomd.run(1e4)
     tuner.update()
-sdf_eq.disable()
-vol_eq.disable()
+if hoomd.comm.get_rank() == 0:
+    sdf_eq.disable()
+    vol_eq.disable()
 
 print(f'End equilibriation to {betaP0}: {hoomd.get_step()}')
 
@@ -146,132 +151,134 @@ print(f'End equilibriation to {betaP0}: {hoomd.get_step()}')
 # NPT simulation
 
 print(f"NPT simulation: {hoomd.get_step()}")
-betaP_logger = hoomd.hpmc.analyze.log(filename='betaP.data', quantities=['volume', 'P', 'N'], period=100)
-sdf_npt = hoomd.hpmc.analyze.sdf(mc=mc, filename=fr'{dir}/' + file + '-npt.sdf', xmax=0.005, dx=1e-6, navg=100, period=100, overwrite=True)
+boxMC_logger = hoomd.analyze.log(filename=fr'{dir}/betaP.data', quantities=['volume', 'P', 'N'], period=10)
+sdf_npt = hoomd.hpmc.analyze.sdf(mc=mc, filename=fr'{dir}/' + file + '-npt.sdf', xmax=0.005, dx=1e-6, navg=1, period=1, overwrite=True)
 for p in numpy.linspace(betaP0,0.0001,100):
-    betaP_logger.register_callback('P', lambda timestep: p)
-    sdf_eq.disable()
+    boxMC_logger.register_callback('P', lambda timestep: p)
+    #sdf_eq.disable()
     boxMC.set_betap(p)
     hoomd.run(1e4)
     tuner.update()
     for t in system.particles.types:
         tuners[t].update()
-    sdf_npt.enable()
-    hoomd.run(1e5)
-
-
-def extrapolate(s, dx, xmax, degree=5):
-  s = s[:int(math.ceil(xmax/dx))]
-  x = np.arange(0,xmax,dx)
-  x += dx/2
-  x = x[:len(s)]
-  p = np.polyfit(x, s, degree)
-  return np.polyval(p, 0.0)
-
-full_volume_data = np.loadtxt(fr'{dir}/' + file + '.vol',skiprows=1)
-
-sdf_data_init = np.loadtxt(fr'{dir}/' + file + '-init.sdf')
-sdf_data_eq = np.loadtxt(fr'{dir}/' + file + '-eq.sdf')
-sdf_data_npt = np.loadtxt(fr'{dir}/' + file + '-npt.sdf')
-
-sdf_t_init = sdf_data_init[:,0]
-sdf_data_init = sdf_data_init[:,1:]
-
-sdf_t_eq = sdf_data_eq[:,0]
-sdf_data_eq = sdf_data_eq[:,1:]
-
-sdf_t_npt = sdf_data_npt[:,0]
-sdf_data_npt = sdf_data_npt[:,1:]
-
-volume_data_init = []
-t_steps = list(map(int,sdf_t_init))
-for vol in full_volume_data:
-    if int(vol[0]) in t_steps:
-        volume_data_init.append(float(vol[1]))
-volume_data_init = np.array(volume_data_init)
-N = full_volume_data[0,2]
-n = len(sdf_data_init)
-dim = 2
-xmax = 0.001
-dx = 1e-7
-
-s0 = []
-for i in range(n):
-    s0.append(extrapolate(sdf_data_init[i], dx, xmax, degree = 5))
-s0 = np.array(s0)
-N = len(system.particles)
-n_density = N/volume_data_init
-betaP = n_density*(1.0 + s0/(2*dim))
-
-with open(fr'{dir}/' + file + "-init.pressure",'w') as pv:
-    pv.writelines('timestep:    volume:     betaP:\n')
-    for i in range(len(t_steps)):
-        pv.writelines(str(t_steps[i]) + ' ' + str(volume_data_init[i]) + '  ' + str(betaP[i]) + '\n')
-
-plt.plot(t_steps,betaP,'--')
-plt.title('Initial')
-plt.savefig(fr"{dir}/Initial")
-plt.show()
-
-volume_data_eq = []
-t_steps = list(map(int,sdf_t_eq))
-for vol in full_volume_data:
-    if int(vol[0]) in t_steps:
-        volume_data_eq.append(float(vol[1]))
-volume_data_eq = np.array(volume_data_eq)
-N = full_volume_data[0,2]
-n = len(sdf_data_eq)
-dim = 2
-xmax = 0.001
-dx = 1e-7
-
-s0 = []
-for i in range(n):
-    s0.append(extrapolate(sdf_data_eq[i], dx, xmax, degree = 5))
-s0 = np.array(s0)
-N = len(system.particles)
-n_density = N/volume_data_eq
-betaP = n_density*(1.0 + s0/(2*dim))
-
-with open(fr'{dir}/' + file + "-eq.pressure",'w') as pv:
-    pv.writelines('timestep:    volume:     betaP:\n')
-    for i in range(len(t_steps)):
-        pv.writelines(str(t_steps[i]) + ' ' + str(volume_data_eq[i]) + '  ' + str(betaP[i]) + '\n')
-
-plt.plot(t_steps,betaP,'--')
-plt.title('Equilibriate')
-plt.savefig(fr"{dir}/Equilibriate")
-plt.show()
-
-volume_data_npt = []
-t_steps = list(map(int,sdf_t_npt))
-for vol in full_volume_data:
-    if int(vol[0]) in t_steps:
-        volume_data_npt.append(float(vol[1]))
-volume_data_npt = np.array(volume_data_npt)
-N = full_volume_data[0,2]
-n = len(sdf_data_npt)
-dim = 2
-xmax = 0.005
-dx = 1e-6
-
-s0 = []
-for i in range(n):
-    s0.append(extrapolate(sdf_data_npt[i], dx, xmax, degree = 5))
-s0 = np.array(s0)
-N = len(system.particles)
-n_density = N/volume_data_npt
-betaP = n_density*(1.0 + s0/(2*dim))
-
-with open(fr'{dir}/' + file + "-npt.pressure",'w') as pv:
-    pv.writelines('timestep:    volume:     betaP:\n')
-    for i in range(len(t_steps)):
-        pv.writelines(str(t_steps[i]) + ' ' + str(volume_data_npt[i]) + '  ' + str(betaP[i]) + '\n')
-
-plt.plot(N * tot_vol/volume_data_npt,betaP,'--')
-plt.title('NPT - betaP')
-plt.savefig(fr"{dir}/NPT")
-plt.show()
+    #sdf_npt.enable()
+    hoomd.run(1e4)
 
 os.system(fr'mv {file}.log {dir}')
+#
+#
+# def extrapolate(s, dx, xmax, degree=5):
+#   s = s[:int(math.ceil(xmax/dx))]
+#   x = np.arange(0,xmax,dx)
+#   x += dx/2
+#   x = x[:len(s)]
+#   p = np.polyfit(x, s, degree)
+#   return np.polyval(p, 0.0)
+#
+# full_volume_data = np.loadtxt(fr'{dir}/' + file + '-.vol',skiprows=1)
+#
+# sdf_data_init = np.loadtxt(fr'{dir}/' + file + '-init.sdf')
+# sdf_data_eq = np.loadtxt(fr'{dir}/' + file + '-eq.sdf')
+# sdf_data_npt = np.loadtxt(fr'{dir}/' + file + '-npt.sdf')
+#
+# sdf_t_init = sdf_data_init[:,0]
+# sdf_data_init = sdf_data_init[:,1:]
+#
+# sdf_t_eq = sdf_data_eq[:,0]
+# sdf_data_eq = sdf_data_eq[:,1:]
+#
+# sdf_t_npt = sdf_data_npt[:,0]
+# sdf_data_npt = sdf_data_npt[:,1:]
+#
+# volume_data_init = []
+# t_steps = list(map(int,sdf_t_init))
+# for vol in full_volume_data:
+#     if int(vol[0]) in t_steps:
+#         volume_data_init.append(float(vol[1]))
+# volume_data_init = np.array(volume_data_init)
+# N = full_volume_data[0,2]
+# n = len(sdf_data_init)
+# dim = 2
+# xmax = 0.001
+# dx = 1e-7
+#
+# s0 = []
+# for i in range(n):
+#     s0.append(extrapolate(sdf_data_init[i], dx, xmax, degree = 5))
+# s0 = np.array(s0)
+# N = len(system.particles)
+# n_density = N/volume_data_init
+# betaP = n_density*(1.0 + s0/(2*dim))
+#
+# with open(fr'{dir}/' + file + "-init.pressure",'w') as pv:
+#     pv.writelines('timestep:    volume:     betaP:\n')
+#     for i in range(len(t_steps)):
+#         pv.writelines(str(t_steps[i]) + ' ' + str(volume_data_init[i]) + '  ' + str(betaP[i]) + '\n')
+#
+# plt.plot(t_steps,betaP,'--')
+# plt.title('Initial')
+# plt.savefig(fr"{dir}/Initial")
+# plt.show()
+#
+# volume_data_eq = []
+# t_steps = list(map(int,sdf_t_eq))
+# for vol in full_volume_data:
+#     if int(vol[0]) in t_steps:
+#         volume_data_eq.append(float(vol[1]))
+# volume_data_eq = np.array(volume_data_eq)
+# N = full_volume_data[0,2]
+# n = len(sdf_data_eq)
+# dim = 2
+# xmax = 0.001
+# dx = 1e-7
+#
+# s0 = []
+# for i in range(n):
+#     s0.append(extrapolate(sdf_data_eq[i], dx, xmax, degree = 5))
+# s0 = np.array(s0)
+# N = len(system.particles)
+# n_density = N/volume_data_eq
+# betaP = n_density*(1.0 + s0/(2*dim))
+#
+# with open(fr'{dir}/' + file + "-eq.pressure",'w') as pv:
+#     pv.writelines('timestep:    volume:     betaP:\n')
+#     for i in range(len(t_steps)):
+#         pv.writelines(str(t_steps[i]) + ' ' + str(volume_data_eq[i]) + '  ' + str(betaP[i]) + '\n')
+#
+# plt.plot(t_steps,betaP,'--')
+# plt.title('Equilibriate')
+# plt.savefig(fr"{dir}/Equilibriate")
+# plt.show()
+#
+# volume_data_npt = []
+# t_steps = list(map(int,sdf_t_npt))
+# for vol in full_volume_data:
+#     if int(vol[0]) in t_steps:
+#         volume_data_npt.append(float(vol[1]))
+# volume_data_npt = np.array(volume_data_npt)
+# N = full_volume_data[0,2]
+# n = len(sdf_data_npt)
+# dim = 2
+# xmax = 0.005
+# dx = 1e-6
+#
+# s0 = []
+# for i in range(n):
+#     s0.append(extrapolate(sdf_data_npt[i], dx, xmax, degree = 5))
+# s0 = np.array(s0)
+# N = len(system.particles)
+# n_density = N/volume_data_npt
+# betaP = n_density*(1.0 + s0/(2*dim))
+#
+# with open(fr'{dir}/' + file + "-npt.pressure",'w') as pv:
+#     pv.writelines('timestep:    volume:     betaP:\n')
+#     for i in range(len(t_steps)):
+#         pv.writelines(str(t_steps[i]) + ' ' + str(volume_data_npt[i]) + '  ' + str(betaP[i]) + '\n')
+#
+# plt.plot(N * tot_vol/volume_data_npt,betaP,'--')
+# plt.title('NPT - betaP')
+# plt.savefig(fr"{dir}/NPT")
+# plt.show()
+
+
 
