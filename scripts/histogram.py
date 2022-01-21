@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import math
-file = r'/Users/zuzannaj/Documents/Spring2022/scripts/tests/test.py2022-01-20 09:50:04.384755.sdf'
+file = r'/scripts/tests/test.py2022-01-20 09:50:04.384755.sdf'
 def extrapolate(s, dx, xmax, degree=5):
   s = s[:int(math.ceil(xmax/dx))]
   x = np.arange(0,xmax,dx)
